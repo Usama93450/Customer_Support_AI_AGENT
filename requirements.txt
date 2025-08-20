@@ -1,0 +1,11 @@
+langchain>=0.2.10
+langgraph>=0.2.0
+langchain-huggingface>=0.0.10
+huggingface_hub>=0.23.0
+transformers>=4.41.0
+sentence-transformers>=2.6.0
+chromadb>=0.5.0
+streamlit>=1.33.0
+pydantic>=2.6
+python-dotenv>=1.0.1
+requests>=2.31.0
