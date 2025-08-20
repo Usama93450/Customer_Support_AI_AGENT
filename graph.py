@@ -1,6 +1,8 @@
 import os
+import tempfile
 from typing import Annotated, Literal, Optional, TypedDict
 
+import streamlit as st
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
@@ -10,36 +12,42 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.prompts import ChatPromptTemplate
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
 
+# --- ENV & Setup ---
 load_dotenv()
-PERSIST_DIR = os.getenv("CHROMA_DIR", "./chroma_kb")
 HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
-# --- Vector store (RAG) ---
+# Embeddings
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# Initialize empty Chroma (runtime persistence in ./chroma_kb)
+PERSIST_DIR = "./chroma_kb"
 vectordb = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
 retriever = vectordb.as_retriever(search_kwargs={"k": 4})
 
+# LLM
 endpoint = HuggingFaceEndpoint(
     repo_id="mistralai/Mistral-7B-Instruct-v0.3",
-    task="conversational",                     # important!
+    task="conversational",
     huggingfacehub_api_token=HF_TOKEN,
     temperature=0.2,
     max_new_tokens=512,
 )
 llm = ChatHuggingFace(llm=endpoint)
+
+# ---- Support Functions ----
 def create_ticket(subject: str, body: str, severity: str = "medium") -> str:
-    # Replace with your ticket system API call
     return f"TCK-{abs(hash((subject, body, severity))) % 10_000:04d}"
 
 def lookup_order_status(order_id: str) -> str:
-    # Replace with your OMS/DB integration
     return f"Order {order_id} is in transit and expected to arrive in 2–3 days."
 
+# ---- State ----
 class BotState(TypedDict):
     messages: Annotated[list, add_messages]
     route: Optional[Literal["faq","order","ticket","handoff"]]
-    
+
 SYSTEM = SystemMessage(content=(
     "You are a helpful Customer Support Agent. "
     "You can: (1) answer FAQs using provided context, "
@@ -94,7 +102,6 @@ def answer_faq(state: BotState):
     msg = llm.invoke(rag_prompt.format_messages(context=context, question=question))
     return {"messages": [AIMessage(content=msg.content)]}
 
-# ----- Order Node -----
 order_prompt = ChatPromptTemplate.from_messages([
     SYSTEM,
     ("user", "Extract an order id from this text if present; otherwise ask for it briefly. Text: {text}")
@@ -107,7 +114,6 @@ def handle_order(state: BotState):
             text = m.content
             break
     extract = llm.invoke(order_prompt.format_messages(text=text)).content
-    # naive parse: find something like #1234 or ORD123 etc. (simplified)
     import re
     m = re.search(r"([A-Z]{2,4}\d{3,}|#?\d{5,})", extract)
     if not m:
@@ -116,7 +122,6 @@ def handle_order(state: BotState):
     status = lookup_order_status(order_id)
     return {"messages": [AIMessage(content=status)]}
 
-# ----- Ticket Node -----
 ticket_prompt = ChatPromptTemplate.from_messages([
     SYSTEM,
     ("user", "Summarize the user's issue in one line subject and 2-3 lines body. Text: {text}")
@@ -129,7 +134,6 @@ def handle_ticket(state: BotState):
             text = m.content
             break
     summary = llm.invoke(ticket_prompt.format_messages(text=text)).content
-    # naive split
     lines = [ln.strip() for ln in summary.splitlines() if ln.strip()]
     subject = lines[0][:120] if lines else "Customer Issue"
     body = "\n".join(lines[1:]) or "User reported an issue."
@@ -137,17 +141,16 @@ def handle_ticket(state: BotState):
     reply = f"✅ Ticket created: **{ticket_id}**\n**Subject:** {subject}\n\n{body}"
     return {"messages": [AIMessage(content=reply)]}
 
-# ----- Handoff Node -----
 def handle_handoff(state: BotState):
     return {"messages": [AIMessage(content="I’m escalating this to a human specialist. You’ll hear back shortly.")]}
 
+# ---- Graph ----
 graph = StateGraph(BotState)
 graph.add_node("classify", classify)
 graph.add_node("faq", answer_faq)
 graph.add_node("order", handle_order)
 graph.add_node("ticket", handle_ticket)
 graph.add_node("handoff", handle_handoff)
-
 graph.set_entry_point("classify")
 
 def route_decider(state: BotState):
@@ -159,11 +162,50 @@ graph.add_conditional_edges("classify", route_decider, {
     "ticket": "ticket",
     "handoff": "handoff"
 })
-
-# after answering, end
 graph.add_edge("faq", END)
 graph.add_edge("order", END)
 graph.add_edge("ticket", END)
 graph.add_edge("handoff", END)
 
 app = graph.compile()
+
+# ---- Streamlit UI ----
+st.set_page_config(page_title="RAG Chatbot", layout="wide")
+st.title("📚 RAG Support Chatbot")
+
+# File uploader
+uploaded_files = st.file_uploader("Upload documents (PDF, TXT, DOCX)", type=["pdf", "txt", "docx"], accept_multiple_files=True)
+
+if uploaded_files:
+    for file in uploaded_files:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(file.read())
+            tmp_path = tmp.name
+        if file.type == "application/pdf":
+            loader = PyPDFLoader(tmp_path)
+        elif file.type == "text/plain":
+            loader = TextLoader(tmp_path)
+        else:
+            loader = Docx2txtLoader(tmp_path)
+        docs = loader.load()
+        vectordb.add_documents(docs)
+    st.success("✅ Documents uploaded and indexed!")
+
+# Chat memory
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+user_input = st.chat_input("Ask me something...")
+if user_input:
+    st.session_state.chat_history.append(HumanMessage(content=user_input))
+    result = app.invoke({"messages": st.session_state.chat_history})
+    st.session_state.chat_history.extend(result["messages"])
+
+# Display chat
+for msg in st.session_state.chat_history:
+    if isinstance(msg, HumanMessage):
+        with st.chat_message("user"):
+            st.write(msg.content)
+    elif isinstance(msg, AIMessage):
+        with st.chat_message("assistant"):
+            st.write(msg.content)
